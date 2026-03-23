@@ -21,6 +21,7 @@ def get_reprs_at_word_tokens(
     module_template: str,
     subtoken: str,
     track: str = "in",
+    decoder_prefixes: List[str] = None,
 ) -> torch.Tensor:
     """
     Retrieves the last token representation of `word` in `context_template`
@@ -37,6 +38,7 @@ def get_reprs_at_word_tokens(
         layer,
         module_template,
         track,
+        decoder_prefixes=decoder_prefixes,
     )
 
 def get_words_idxs_in_templates(
@@ -120,6 +122,7 @@ def get_reprs_at_idxs(
     layer: int,
     module_template: str,
     track: str = "in",
+    decoder_prefixes: List[str] = None,
 ) -> torch.Tensor:
     """
     Runs input through model and returns averaged representations of the tokens
@@ -147,11 +150,49 @@ def get_reprs_at_idxs(
         for i, idx_list in enumerate(batch_idxs):
             to_return[key].append(cur_repr[i][idx_list].mean(0))
 
+    is_seq2seq = getattr(model.config, "is_encoder_decoder", False)
+    batch_start = 0
+
     for batch_contexts, batch_idxs in _batch(n=128):
         #contexts_tok:[21 19]
         contexts_tok = tok(batch_contexts, padding=True, return_tensors="pt").to(
             next(model.parameters()).device
         )
+
+        if is_seq2seq:
+            # For encoder-decoder models the decoder must be running to get
+            # decoder-layer activations.  Build decoder_input_ids from the
+            # per-sample decoder prefix (defaults to empty → just start token).
+            dec_start_id = model.config.decoder_start_token_id
+            device = contexts_tok["input_ids"].device
+            n = len(batch_contexts)
+
+            batch_pfxs = (
+                decoder_prefixes[batch_start : batch_start + n]
+                if decoder_prefixes is not None
+                else [""] * n
+            )
+            # Tokenize each prefix; build [start, prefix_tokens...] per sample.
+            # Each prefix may be a string, a list[int], or a Tensor.
+            dec_seqs = []
+            for pfx in batch_pfxs:
+                if isinstance(pfx, torch.Tensor):
+                    pfx_ids = pfx.flatten().cpu().tolist()
+                elif isinstance(pfx, (list, tuple)):
+                    pfx_ids = [int(x) for x in pfx]
+                else:
+                    pfx_ids = tok(pfx, add_special_tokens=False)["input_ids"] if pfx else []
+                dec_seqs.append([dec_start_id] + pfx_ids)
+            max_dec_len = max(len(s) for s in dec_seqs)
+            pad_id = tok.pad_token_id if tok.pad_token_id is not None else 0
+            padded = [s + [pad_id] * (max_dec_len - len(s)) for s in dec_seqs]
+            contexts_tok["decoder_input_ids"] = torch.tensor(
+                padded, dtype=torch.long, device=device
+            )
+            # Extract at the last real decoder position (where target is predicted).
+            batch_idxs = [[len(s) - 1] for s in dec_seqs]
+
+        batch_start += len(batch_contexts)
 
         with torch.no_grad():
             with nethook.Trace(

@@ -32,11 +32,12 @@ def apply_AlphaEdit_to_model(
     Executes the MEMIT update algorithm for the specified update at the specified layer
     Invariant: model at beginning of function == model at end of function
     """
+    device = next(model.parameters()).device
 
     # Update target and print info
     requests = deepcopy(requests)
     for i, request in enumerate(requests):
-        if request["target_new"]["str"][0] != " ":
+        if request["target_new"]["str"][0] != " " and 't5' not in model.config.model_type:
             # Space required for correct tokenization
             requests[i]["target_new"]["str"] = " " + request["target_new"]["str"]
     for request in requests[:10]:
@@ -75,7 +76,7 @@ def apply_AlphaEdit_to_model(
         ):
             try:
                 data = np.load(cache_fname)
-                z_list.append(torch.from_numpy(data["v_star"]).to("cuda"))
+                z_list.append(torch.from_numpy(data["v_star"]).to(device))
                 data_loaded = True
             except Exception as e:
                 print(f"Error reading cache file due to {e}. Recomputing...")
@@ -120,6 +121,7 @@ def apply_AlphaEdit_to_model(
             words=[request["subject"] for request in requests],
             module_template=hparams.layer_module_tmp,
             fact_token_strategy=hparams.fact_token,
+            decoder_prefixes=[request.get("decoder_prefix", "") for request in requests],
         )[1].T
         targets = zs - cur_zs
         print("z error", torch.linalg.norm(targets, dim=0).mean())
@@ -127,9 +129,15 @@ def apply_AlphaEdit_to_model(
         repeat_factor = (layer_ks.size(1) // targets.size(1))
         targets = targets.repeat_interleave(repeat_factor, dim=1)
         resid = targets / (len(hparams.layers) - i)  # Distribute residual across layers
+        P_i = P[i, :, :].to(device)
+        cache_i = cache_c[i, :, :].to(device)
+        print("Layer, cache shapes:", layer_ks.shape, cache_i.shape, flush=True)
+
         upd_matrix = torch.linalg.solve(
-                P[i,:,:].cuda() @ (layer_ks @ layer_ks.T + cache_c[i,:,:].cuda()) + hparams.L2*torch.eye(layer_ks.shape[0], dtype=torch.float,device="cuda"), P[i,:,:].cuda() @ layer_ks @ resid.T
+                P_i @ (layer_ks @ layer_ks.T + cache_i) + hparams.L2 * torch.eye(layer_ks.shape[0], dtype=torch.float, device=device),
+                P_i @ layer_ks @ resid.T,
         )
+
         # Adjust update matrix shape
         weight_name = f"{hparams.rewrite_module_tmp.format(layer)}.weight"
         upd_matrix = upd_matrix_match_shape(upd_matrix, weights[weight_name].shape)
@@ -142,7 +150,8 @@ def apply_AlphaEdit_to_model(
         for x in [layer_ks, cur_zs, targets, upd_matrix]:
             x.cpu()
             del x
-        torch.cuda.empty_cache()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
     for i, layer in enumerate(hparams.layers):
         layer_ks = compute_ks(model, tok, requests, hparams, layer, context_templates).T
         cache_c[i,:,:] += layer_ks.cpu() @ layer_ks.cpu().T
@@ -165,6 +174,7 @@ def get_cov(
     Retrieves covariance statistics, then computes the algebraic inverse.
     Caches result for future use.
     """
+    device = next(model.parameters()).device
 
     model_name = model.config._name_or_path.replace("/", "_")
     key = (model_name, layer_name)
@@ -185,7 +195,7 @@ def get_cov(
         COV_CACHE[key] = stat.mom2.moment().float().to("cpu")
 
     return (
-        torch.inverse(COV_CACHE[key].to("cuda")) if inv else COV_CACHE[key].to("cuda")
+        torch.inverse(COV_CACHE[key].to(device)) if inv else COV_CACHE[key].to(device)
     )
 
 
@@ -210,19 +220,24 @@ def get_context_templates(model, tok):
     global CONTEXT_TEMPLATES_CACHE
 
     if CONTEXT_TEMPLATES_CACHE is None:
-        CONTEXT_TEMPLATES_CACHE = [["{}"]] + [
-            [
-                f.replace("{", " ").replace("}", " ") + ". {}"
-                for f in generate_fast(
-                    model,
-                    tok,
-                    ["The", "Therefore", "Because", "I", "You"],
-                    n_gen_per_prompt=n_gen // 5,
-                    max_out_len=length,
-                )
+        if getattr(model.config, "is_encoder_decoder", False):
+            # generate_fast is a causal-LM loop and will not work for
+            # encoder-decoder models.  A single identity template is sufficient.
+            CONTEXT_TEMPLATES_CACHE = [["{}"]]
+        else:
+            CONTEXT_TEMPLATES_CACHE = [["{}"]] + [
+                [
+                    f.replace("{", " ").replace("}", " ") + ". {}"
+                    for f in generate_fast(
+                        model,
+                        tok,
+                        ["The", "Therefore", "Because", "I", "You"],
+                        n_gen_per_prompt=n_gen // 5,
+                        max_out_len=length,
+                    )
+                ]
+                for length, n_gen in [(10, 5)]  # Be careful about changing this.
             ]
-            for length, n_gen in [(10, 5)]  # Be careful about changing this.
-        ]
         print(f"Cached context templates {CONTEXT_TEMPLATES_CACHE}")
 
     return CONTEXT_TEMPLATES_CACHE

@@ -92,6 +92,7 @@ def layer_stats(
     """
     Function to load or compute cached stats.
     """
+    is_seq2seq = getattr(model.config, "is_encoder_decoder", False)
 
     def get_ds():
         # Load_From_File
@@ -111,7 +112,7 @@ def layer_stats(
         elif hasattr(model.config,'seq_length'):
             maxlen = model.config.seq_length
         else:
-            raise NotImplementedError
+            maxlen = 512  # fallback for models with relative position encodings (e.g. T5)
                 
         if hasattr(model.config, 'model_type') and 'mistral' in model.config.model_type:
             if hasattr(model.config, 'sliding_window') and model.config.sliding_window:
@@ -123,7 +124,7 @@ def layer_stats(
 
         if batch_tokens is not None and batch_tokens < maxlen:
             maxlen = batch_tokens
-        return TokenizedDataset(raw_ds["train"], tokenizer, maxlen=maxlen)
+        return TokenizedDataset(raw_ds["train"], tokenizer, maxlen=maxlen, is_seq2seq=is_seq2seq)
 
     # Continue with computation of statistics
     batch_size = 1  # Examine this many dataset texts at once
@@ -136,7 +137,7 @@ def layer_stats(
     elif hasattr(model.config,'seq_length'):
         npos = model.config.seq_length
     else:
-        raise NotImplementedError
+        npos = 512  # fallback for models with relative position encodings (e.g. T5)
         
     if hasattr(model.config, 'model_type') and 'mistral' in model.config.model_type:
         if hasattr(model.config, 'sliding_window') and model.config.sliding_window:
@@ -176,15 +177,24 @@ def layer_stats(
         sample_size=sample_size,
         batch_size=batch_size,
         collate_fn=length_collation(batch_tokens),
-        pin_memory=True,
+        pin_memory=(next(model.parameters()).device.type == "cuda"),
         random_sample=1,
-        num_workers=2,
+        # Multiprocessing can require picklable callables; `length_collation` returns a
+        # local function, so use single-process loading for portability (macOS/MPS).
+        num_workers=0,
     )
     batch_count = -(-(sample_size or len(ds)) // batch_size)
+    device = next(model.parameters()).device
+
     with torch.no_grad():
         for batch_group in progress(loader, total=batch_count):
             for batch in batch_group:
-                batch = dict_to_(batch, "cuda")
+                batch = dict_to_(batch, device)
+                if is_seq2seq:
+                    # Option B (copy task): feed the same wikitext to the decoder
+                    # so the decoder MLP sees a rich, realistic activation distribution
+                    # rather than just a single start token.
+                    batch["decoder_input_ids"] = batch["input_ids"].clone()
                 with Trace(
                     model, layer_name, retain_input=True, retain_output=False, stop=True
                 ) as tr:

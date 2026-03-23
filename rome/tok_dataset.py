@@ -10,11 +10,12 @@ class TokenizedDataset(Dataset):
     ids and attention masks, they can be supplied direcly to the model.
     """
 
-    def __init__(self, text_dataset, tokenizer=None, maxlen=None, field="text"):
+    def __init__(self, text_dataset, tokenizer=None, maxlen=None, field="text", is_seq2seq=False):
         self.text_dataset = text_dataset
         self.field = field
         self.tokenizer = tokenizer
         self.maxlen = maxlen
+        self.is_seq2seq = is_seq2seq
         if hasattr(text_dataset, "info"):
             self.info = text_dataset.info
 
@@ -28,13 +29,14 @@ class TokenizedDataset(Dataset):
         token_list = self.tokenizer.encode(
             text, truncation=True, max_length=self.maxlen
         )
-        position_ids = list(range(len(token_list)))
         attention_mask = [1] * len(token_list)
-        return dict(
+        item = dict(
             input_ids=torch.tensor(token_list),
-            position_ids=torch.tensor(position_ids),
             attention_mask=torch.tensor(attention_mask),
         )
+        if not self.is_seq2seq:
+            item["position_ids"] = torch.tensor(list(range(len(token_list))))
+        return item
 
 
 def dict_to_(data, device):

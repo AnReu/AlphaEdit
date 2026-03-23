@@ -10,6 +10,24 @@ from util import nethook
 from .AlphaEdit_hparams import AlphaEditHyperParams
 
 
+def _to_token_ids(value, tok, add_special_tokens: bool = False) -> List[int]:
+    """
+    Normalise *value* to a plain Python list of int token IDs.
+
+    Accepts:
+      - str                  → tokenised with *tok*
+      - List[int] / Tuple    → returned as list[int] (already tokenised)
+      - torch.Tensor         → flattened to list[int] (already tokenised)
+    """
+    if isinstance(value, torch.Tensor):
+        return value.flatten().cpu().tolist()
+    if isinstance(value, (list, tuple)):
+        return [int(x) for x in value]
+    if isinstance(value, str):
+        return tok(value, add_special_tokens=add_special_tokens)["input_ids"]
+    raise TypeError(f"Expected str, list, or Tensor; got {type(value)!r}")
+
+
 def compute_z(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
@@ -34,11 +52,19 @@ def compute_z(
         lm_b = next(model.parameters()).new_zeros(model.config.vocab_size)
 
     print("Computing right vector (v)")
+    device = next(model.parameters()).device
 
-    # Tokenize target into list of int token IDs
-    target_ids = tok(request["target_new"]["str"], return_tensors="pt").to("cuda")[
-        "input_ids"
-    ][0]
+    # Normalise target to a 1-D tensor of token IDs.
+    # request["target_new"] may be:
+    #   {"str": "Paris"}              → tokenise the string
+    #   {"ids": [1234, ...]}          → use ids directly
+    #   a list/tensor of ints         → use directly
+    _tgt_val = request["target_new"]
+    if isinstance(_tgt_val, dict):
+        _tgt_val = _tgt_val.get("ids") if "ids" in _tgt_val else _tgt_val["str"]
+    target_ids = torch.tensor(
+        _to_token_ids(_tgt_val, tok, add_special_tokens=True), device=device
+    )
 
     if target_ids[0] == tok.bos_token_id or target_ids[0] == tok.unk_token_id:
         target_ids = target_ids[1:]
@@ -54,23 +80,61 @@ def compute_z(
         [prompt.format(request["subject"]) for prompt in all_prompts],
         return_tensors="pt",
         padding=True,
-    ).to("cuda")
+    ).to(device)
 
-    # Compute rewriting targets
-    rewriting_targets = torch.tensor(-100, device="cuda").repeat(
-        len(rewriting_prompts), *input_tok["input_ids"].shape[1:]
-    )
-    for i in range(len(rewriting_prompts)):
-        ex_len = input_tok["attention_mask"][i].sum()
-        rewriting_targets[i, ex_len - len(target_ids) : ex_len] = target_ids
+    is_seq2seq = getattr(model.config, "is_encoder_decoder", False)
 
-    # Compute indices of the tokens where the fact is looked up
-    lookup_idxs = [
-        find_fact_lookup_idx(
-            prompt, request["subject"], tok, hparams.fact_token, verbose=(i == 0)
+    if is_seq2seq:
+        # For encoder-decoder (e.g. T5): the encoder receives the question
+        # prompt only; the decoder receives [start, decoder_prefix_tokens...].
+        # We must NOT append target tokens to the encoder input (causal-LM style).
+        # decoder_prefix may be a string, a list[int], or a Tensor.
+        decoder_prefix = request.get("decoder_prefix", "")
+        prefix_ids = _to_token_ids(decoder_prefix, tok) if decoder_prefix else []
+        dec_start_id = model.config.decoder_start_token_id
+        dec_ids = [dec_start_id] + prefix_ids   # decoder input sequence
+        lookup_pos = len(prefix_ids)             # decoder position where target is predicted
+
+        # Rebuild rewriting_prompts without target tokens in the encoder input.
+        rewriting_prompts = [
+            context.format(request["prompt"])
+            for context_types in context_templates
+            for context in context_types
+        ]
+        all_prompts = rewriting_prompts + kl_prompts
+        input_tok = tok(
+            [prompt.format(request["subject"]) for prompt in all_prompts],
+            return_tensors="pt",
+            padding=True,
+        ).to(device)
+
+        n_prompts = input_tok["input_ids"].shape[0]
+        input_tok["decoder_input_ids"] = torch.tensor(
+            [dec_ids] * n_prompts, dtype=torch.long, device=device
         )
-        for i, prompt in enumerate(all_prompts)
-    ]
+        # Target at decoder position `lookup_pos`; -100 (ignored) elsewhere.
+        rewriting_targets = torch.full(
+            (len(rewriting_prompts), len(dec_ids)), -100, dtype=torch.long, device=device
+        )
+        for i in range(len(rewriting_prompts)):
+            rewriting_targets[i, lookup_pos] = target_ids[0]
+        lookup_idxs = [lookup_pos] * n_prompts
+    else:
+        # Compute rewriting targets
+        rewriting_targets = torch.tensor(-100, device=device).repeat(
+            len(rewriting_prompts), *input_tok["input_ids"].shape[1:]
+        )
+        for i in range(len(rewriting_prompts)):
+            ex_len = input_tok["attention_mask"][i].sum()
+            rewriting_targets[i, ex_len - len(target_ids) : ex_len] = target_ids
+
+        # Compute indices of the tokens where the fact is looked up
+        lookup_idxs = [
+            find_fact_lookup_idx(
+                prompt, request["subject"], tok, hparams.fact_token, verbose=(i == 0)
+            )
+            for i, prompt in enumerate(all_prompts)
+        ]
 
     # Finalize rewrite and loss layers
     loss_layer = max(hparams.v_loss_layer, layer)
@@ -81,9 +145,11 @@ def compute_z(
     # rewrite layer, i.e. hypothesized fact lookup location, will induce the
     # target token to be predicted at the final layer.
     if hasattr(model.config, 'n_embd'):
-        delta = torch.zeros((model.config.n_embd,), requires_grad=True, device="cuda")
+        delta = torch.zeros((model.config.n_embd,), requires_grad=True, device=device)
     elif hasattr(model.config, 'hidden_size'):
-        delta = torch.zeros((model.config.hidden_size,), requires_grad=True, device="cuda")
+        delta = torch.zeros((model.config.hidden_size,), requires_grad=True, device=device)
+    elif hasattr(model.config, 'd_model'):
+        delta = torch.zeros((model.config.d_model,), requires_grad=True, device=device)
     else:
         raise NotImplementedError
     target_init, kl_distr_init = None, None
@@ -169,7 +235,7 @@ def compute_z(
         loss = nll_loss + kl_loss.to(nll_loss.device) + weight_decay.to(nll_loss.device)
         print(
             f"loss {np.round(loss.item(), 3)} = {np.round(nll_loss.item(), 3)} + {np.round(kl_loss.item(), 3)} + {np.round(weight_decay.item(), 3)} "
-            f"avg prob of [{request['target_new']['str']}] "
+            f"avg prob of [{request['target_new'].get('str', request['target_new']) if isinstance(request['target_new'], dict) else request['target_new']}] "
             f"{torch.exp(-nll_loss_each).mean().item()}"
         )
         if loss < 5e-2:
@@ -180,6 +246,9 @@ def compute_z(
 
         # Backpropagate
         loss.backward()
+        if it == 0:
+            print(f"[debug] lookup_pos={lookup_pos}, len(prefix_ids)={len(prefix_ids)}, "
+                  f"dec_ids={dec_ids}, delta.grad={'None' if delta.grad is None else delta.grad.norm().item():.4f}")
         opt.step()
 
         # Project within L2 ball
@@ -204,6 +273,7 @@ def get_module_input_output_at_words(
     words: List[str],
     module_template: str,
     fact_token_strategy: str,
+    decoder_prefixes: List[str] = None,
 ) -> Tuple[torch.Tensor]:
     """
     Retrieves detached representations for a word at the input and
@@ -223,7 +293,8 @@ def get_module_input_output_at_words(
         )
         subtoken = fact_token_strategy[len("subject_") :]
         l_input, l_output = repr_tools.get_reprs_at_word_tokens(
-            track="both", subtoken=subtoken, **context_info, **word_repr_args
+            track="both", subtoken=subtoken, decoder_prefixes=decoder_prefixes,
+            **context_info, **word_repr_args
         )
     elif fact_token_strategy == "last":
         raise Exception("This is definitely bugged, fix it.")
